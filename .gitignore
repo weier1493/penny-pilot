@@ -1,0 +1,45 @@
+# Environment variable files
+.env
+.env.*
+*.env
+*.env.*
+
+# Keep shared environment templates
+!.env.example
+!.env.*.example
+!*.env.example
+!.env.sample
+!.env.*.sample
+!*.env.sample
+!.env.template
+!.env.*.template
+!*.env.template
+!.env.dist
+!.env.*.dist
+!*.env.dist
+
+# Shell and framework environment files
+.envrc
+.direnv/
+.flaskenv
+
+# Local overrides and secret configuration
+.env.local
+.env.*.local
+*.local.env
+*.local.env.*
+local.settings.json
+appsettings.Local.json
+appsettings.*.Local.json
+secrets.json
+secrets.yml
+secrets.yaml
+
+# Python virtual environments
+.venv/
+.virtualenv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
