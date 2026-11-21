@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
-import calendar
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Iterator
+
+from date_utils import (
+    build_periods,
+    month_bounds,
+    normalize_date,
+    normalize_granularity,
+    normalize_month,
+    period_key,
+)
 
 # SQLite 等待其他连接释放锁的最长时间，单位是毫秒。
 _BUSY_TIMEOUT_MS = 5000
@@ -43,6 +51,8 @@ _REQUIRED_COLUMNS = {
 
 class DBmanager:
     """负责文件型 SQLite 数据库初始化和账目数据访问。"""
+
+    # 初始化与连接管理
 
     def __init__(self, db_path: str | Path = "pennypilot.db"):
         """解析数据库路径、创建父目录并初始化数据库结构。"""
@@ -176,7 +186,8 @@ class DBmanager:
         conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         return conn
 
-    # 分类操作
+    # 增：创建分类和账目
+
     def add_category(self, name: str, kind: str) -> dict[str, Any]:
         """新增一个启用状态的收入或支出分类。"""
         name = self._normalize_name(name)
@@ -196,40 +207,91 @@ class DBmanager:
 
             return self._fetch_category(conn, category_id)
 
-    def list_categories(
+    def add_transaction(
         self,
-        kind: str | None = None,
-        active_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        """按收支类型筛选分类，默认只返回启用分类。"""
-        if kind is not None:
-            kind = self._validate_kind(kind)
-
-        if not isinstance(active_only, bool):
-            raise ValueError("active_only must be a bool")
-
-        conditions = []
-        params: list[Any] = []
-
-        if kind is not None:
-            conditions.append("kind = ?")
-            params.append(kind)
-
-        if active_only:
-            conditions.append("is_active = 1")
-
-        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        kind: str,
+        amount_cents: int,
+        category_id: int,
+        occurred_on: str | date,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """新增账目，并校验金额、日期、分类类型和启用状态。"""
+        kind = self._validate_kind(kind)
+        amount_cents = self._validate_amount(
+            amount_cents,
+            allow_zero=False,
+        )
+        category_id = self._validate_id(category_id, "category_id")
+        occurred_on = normalize_date(occurred_on)
+        note = self._normalize_note(note)
+        now = self._now()
 
         with self._connection() as conn:
-            rows = conn.execute(
-                "SELECT id, name, kind, is_active, created_at, updated_at "
-                "FROM categories"
-                + where
-                + " ORDER BY kind, id",
-                params,
-            ).fetchall()
+            with conn:
+                # 外键只检查分类是否存在，这里额外检查类型和启用状态。
+                self._fetch_category(
+                    conn,
+                    category_id,
+                    required_kind=kind,
+                    require_active=True,
+                )
+                cursor = conn.execute(
+                    "INSERT INTO transactions "
+                    "(kind, amount_cents, category_id, occurred_on, "
+                    "note, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        kind,
+                        amount_cents,
+                        category_id,
+                        occurred_on,
+                        note,
+                        now,
+                        now,
+                    ),
+                )
+                transaction_id = int(cursor.lastrowid)
 
-            return [self._category_dict(row) for row in rows]
+            return self._fetch_transaction(conn, transaction_id)
+
+    # 删：删除账目和预算
+
+    def delete_transaction(self, transaction_id: int) -> None:
+        """按 ID 删除账目，记录不存在时抛出异常。"""
+        transaction_id = self._validate_id(
+            transaction_id,
+            "transaction_id",
+        )
+
+        with self._connection() as conn:
+            with conn:
+                cursor = conn.execute(
+                    "DELETE FROM transactions WHERE id = ?",
+                    (transaction_id,),
+                )
+                if cursor.rowcount == 0:
+                    raise LookupError("transaction not found")
+
+    def delete_budget(
+        self,
+        category_id: int,
+        month: str,
+    ) -> None:
+        """删除指定分类和月份对应的预算。"""
+        category_id = self._validate_id(category_id, "category_id")
+        month = normalize_month(month)
+
+        with self._connection() as conn:
+            with conn:
+                cursor = conn.execute(
+                    "DELETE FROM budgets "
+                    "WHERE category_id = ? AND month = ?",
+                    (category_id, month),
+                )
+                if cursor.rowcount == 0:
+                    raise LookupError("budget not found")
+
+    # 改：修改记录、状态和预算
 
     def rename_category(
         self,
@@ -277,53 +339,186 @@ class DBmanager:
 
             return self._fetch_category(conn, category_id)
 
-    # 账目操作
-    def add_transaction(
+    def update_transaction(
         self,
-        kind: str,
-        amount_cents: int,
-        category_id: int,
-        occurred_on: str | date,
-        note: str = "",
+        transaction_id: int,
+        *,
+        kind: str | None = None,
+        amount_cents: int | None = None,
+        category_id: int | None = None,
+        occurred_on: str | date | None = None,
+        note: str | None = None,
     ) -> dict[str, Any]:
-        """新增账目，并校验金额、日期、分类类型和启用状态。"""
-        kind = self._validate_kind(kind)
+        """部分更新账目；类型或分类变化时重新校验二者是否匹配。"""
+        transaction_id = self._validate_id(
+            transaction_id,
+            "transaction_id",
+        )
+
+        if all(
+            value is None
+            for value in (
+                kind,
+                amount_cents,
+                category_id,
+                occurred_on,
+                note,
+            )
+        ):
+            raise ValueError("at least one field must be provided")
+
+        if kind is not None:
+            kind = self._validate_kind(kind)
+
+        if amount_cents is not None:
+            amount_cents = self._validate_amount(
+                amount_cents,
+                allow_zero=False,
+            )
+
+        if category_id is not None:
+            category_id = self._validate_id(category_id, "category_id")
+
+        if occurred_on is not None:
+            occurred_on = normalize_date(occurred_on)
+
+        if note is not None:
+            note = self._normalize_note(note)
+
+        with self._connection() as conn:
+            with conn:
+                current = conn.execute(
+                    "SELECT kind, category_id "
+                    "FROM transactions WHERE id = ?",
+                    (transaction_id,),
+                ).fetchone()
+
+                if current is None:
+                    raise LookupError("transaction not found")
+
+                final_kind = (
+                    kind if kind is not None else current["kind"]
+                )
+                final_category_id = (
+                    category_id
+                    if category_id is not None
+                    else current["category_id"]
+                )
+
+                # 只有类型或分类发生变化时才需要重新检查组合合法性。
+                if kind is not None or category_id is not None:
+                    self._fetch_category(
+                        conn,
+                        final_category_id,
+                        required_kind=final_kind,
+                        require_active=True,
+                    )
+
+                changes = []
+                values: list[Any] = []
+
+                for column, value in (
+                    ("kind", kind),
+                    ("amount_cents", amount_cents),
+                    ("category_id", category_id),
+                    ("occurred_on", occurred_on),
+                    ("note", note),
+                ):
+                    if value is not None:
+                        changes.append(f"{column} = ?")
+                        values.append(value)
+
+                changes.append("updated_at = ?")
+                values.extend([self._now(), transaction_id])
+
+                conn.execute(
+                    "UPDATE transactions SET "
+                    + ", ".join(changes)
+                    + " WHERE id = ?",
+                    values,
+                )
+
+            return self._fetch_transaction(conn, transaction_id)
+
+    def set_budget(
+        self,
+        category_id: int,
+        month: str,
+        amount_cents: int,
+    ) -> dict[str, Any]:
+        """新增或更新某支出分类的月度预算。"""
+        category_id = self._validate_id(category_id, "category_id")
+        month = normalize_month(month)
         amount_cents = self._validate_amount(
             amount_cents,
-            allow_zero=False,
+            allow_zero=True,
         )
-        category_id = self._validate_id(category_id, "category_id")
-        occurred_on = self._normalize_date(occurred_on)
-        note = self._normalize_note(note)
         now = self._now()
 
         with self._connection() as conn:
             with conn:
-                # 外键只检查分类是否存在，这里额外检查类型和启用状态。
                 self._fetch_category(
                     conn,
                     category_id,
-                    required_kind=kind,
+                    required_kind="expense",
                     require_active=True,
                 )
-                cursor = conn.execute(
-                    "INSERT INTO transactions "
-                    "(kind, amount_cents, category_id, occurred_on, "
-                    "note, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                conn.execute(
+                    # 同一分类和月份只能有一条预算，冲突时更新金额。
+                    "INSERT INTO budgets "
+                    "(category_id, month, amount_cents, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(category_id, month) DO UPDATE SET "
+                    "amount_cents = excluded.amount_cents, "
+                    "updated_at = excluded.updated_at",
                     (
-                        kind,
-                        amount_cents,
                         category_id,
-                        occurred_on,
-                        note,
+                        month,
+                        amount_cents,
                         now,
                         now,
                     ),
                 )
-                transaction_id = int(cursor.lastrowid)
 
-            return self._fetch_transaction(conn, transaction_id)
+            return self._fetch_budget(conn, category_id, month)
+
+    # 查：查询记录、预算和统计数据
+
+    def list_categories(
+        self,
+        kind: str | None = None,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """按收支类型筛选分类，默认只返回启用分类。"""
+        if kind is not None:
+            kind = self._validate_kind(kind)
+
+        if not isinstance(active_only, bool):
+            raise ValueError("active_only must be a bool")
+
+        conditions = []
+        params: list[Any] = []
+
+        if kind is not None:
+            conditions.append("kind = ?")
+            params.append(kind)
+
+        if active_only:
+            conditions.append("is_active = 1")
+
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, name, kind, is_active, created_at, updated_at "
+                "FROM categories"
+                + where
+                + " ORDER BY kind, id",
+                params,
+            ).fetchall()
+
+            return [self._category_dict(row) for row in rows]
 
     def get_transaction(
         self,
@@ -350,10 +545,10 @@ class DBmanager:
     ) -> dict[str, Any]:
         """按日期、类型、分类和关键词筛选账目并分页返回。"""
         if start_date is not None:
-            start_date = self._normalize_date(start_date)
+            start_date = normalize_date(start_date)
 
         if end_date is not None:
-            end_date = self._normalize_date(end_date)
+            end_date = normalize_date(end_date)
 
         if start_date and end_date and start_date > end_date:
             raise ValueError("start_date must not be later than end_date")
@@ -431,167 +626,6 @@ class DBmanager:
                 "total": total,
             }
 
-    def update_transaction(
-        self,
-        transaction_id: int,
-        *,
-        kind: str | None = None,
-        amount_cents: int | None = None,
-        category_id: int | None = None,
-        occurred_on: str | date | None = None,
-        note: str | None = None,
-    ) -> dict[str, Any]:
-        """部分更新账目；类型或分类变化时重新校验二者是否匹配。"""
-        transaction_id = self._validate_id(
-            transaction_id,
-            "transaction_id",
-        )
-
-        if all(
-            value is None
-            for value in (
-                kind,
-                amount_cents,
-                category_id,
-                occurred_on,
-                note,
-            )
-        ):
-            raise ValueError("at least one field must be provided")
-
-        if kind is not None:
-            kind = self._validate_kind(kind)
-
-        if amount_cents is not None:
-            amount_cents = self._validate_amount(
-                amount_cents,
-                allow_zero=False,
-            )
-
-        if category_id is not None:
-            category_id = self._validate_id(category_id, "category_id")
-
-        if occurred_on is not None:
-            occurred_on = self._normalize_date(occurred_on)
-
-        if note is not None:
-            note = self._normalize_note(note)
-
-        with self._connection() as conn:
-            with conn:
-                current = conn.execute(
-                    "SELECT kind, category_id "
-                    "FROM transactions WHERE id = ?",
-                    (transaction_id,),
-                ).fetchone()
-
-                if current is None:
-                    raise LookupError("transaction not found")
-
-                final_kind = (
-                    kind if kind is not None else current["kind"]
-                )
-                final_category_id = (
-                    category_id
-                    if category_id is not None
-                    else current["category_id"]
-                )
-
-                # 只有类型或分类发生变化时才需要重新检查组合合法性。
-                if kind is not None or category_id is not None:
-                    self._fetch_category(
-                        conn,
-                        final_category_id,
-                        required_kind=final_kind,
-                        require_active=True,
-                    )
-
-                changes = []
-                values: list[Any] = []
-
-                for column, value in (
-                    ("kind", kind),
-                    ("amount_cents", amount_cents),
-                    ("category_id", category_id),
-                    ("occurred_on", occurred_on),
-                    ("note", note),
-                ):
-                    if value is not None:
-                        changes.append(f"{column} = ?")
-                        values.append(value)
-
-                changes.append("updated_at = ?")
-                values.extend([self._now(), transaction_id])
-
-                conn.execute(
-                    "UPDATE transactions SET "
-                    + ", ".join(changes)
-                    + " WHERE id = ?",
-                    values,
-                )
-
-            return self._fetch_transaction(conn, transaction_id)
-
-    def delete_transaction(self, transaction_id: int) -> None:
-        """按 ID 删除账目，记录不存在时抛出异常。"""
-        transaction_id = self._validate_id(
-            transaction_id,
-            "transaction_id",
-        )
-
-        with self._connection() as conn:
-            with conn:
-                cursor = conn.execute(
-                    "DELETE FROM transactions WHERE id = ?",
-                    (transaction_id,),
-                )
-                if cursor.rowcount == 0:
-                    raise LookupError("transaction not found")
-
-    # 预算操作
-    def set_budget(
-        self,
-        category_id: int,
-        month: str,
-        amount_cents: int,
-    ) -> dict[str, Any]:
-        """新增或更新某支出分类的月度预算。"""
-        category_id = self._validate_id(category_id, "category_id")
-        month = self._normalize_month(month)
-        amount_cents = self._validate_amount(
-            amount_cents,
-            allow_zero=True,
-        )
-        now = self._now()
-
-        with self._connection() as conn:
-            with conn:
-                self._fetch_category(
-                    conn,
-                    category_id,
-                    required_kind="expense",
-                    require_active=True,
-                )
-                conn.execute(
-                    # 同一分类和月份只能有一条预算，冲突时更新金额。
-                    "INSERT INTO budgets "
-                    "(category_id, month, amount_cents, "
-                    "created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(category_id, month) DO UPDATE SET "
-                    "amount_cents = excluded.amount_cents, "
-                    "updated_at = excluded.updated_at",
-                    (
-                        category_id,
-                        month,
-                        amount_cents,
-                        now,
-                        now,
-                    ),
-                )
-
-            return self._fetch_budget(conn, category_id, month)
-
     def get_budget(
         self,
         category_id: int,
@@ -599,14 +633,14 @@ class DBmanager:
     ) -> dict[str, Any]:
         """按分类 ID 和月份查询一条预算。"""
         category_id = self._validate_id(category_id, "category_id")
-        month = self._normalize_month(month)
+        month = normalize_month(month)
 
         with self._connection() as conn:
             return self._fetch_budget(conn, category_id, month)
 
     def list_budgets(self, month: str) -> list[dict[str, Any]]:
         """查询指定月份的全部预算并附带分类信息。"""
-        month = self._normalize_month(month)
+        month = normalize_month(month)
 
         with self._connection() as conn:
             rows = conn.execute(
@@ -626,34 +660,14 @@ class DBmanager:
 
             return [self._budget_dict(row) for row in rows]
 
-    def delete_budget(
-        self,
-        category_id: int,
-        month: str,
-    ) -> None:
-        """删除指定分类和月份对应的预算。"""
-        category_id = self._validate_id(category_id, "category_id")
-        month = self._normalize_month(month)
-
-        with self._connection() as conn:
-            with conn:
-                cursor = conn.execute(
-                    "DELETE FROM budgets "
-                    "WHERE category_id = ? AND month = ?",
-                    (category_id, month),
-                )
-                if cursor.rowcount == 0:
-                    raise LookupError("budget not found")
-
-    # 统计查询
     def get_summary(
         self,
         start_date: str | date,
         end_date: str | date,
     ) -> dict[str, Any]:
         """统计日期范围内的收入、支出、结余和账目数量。"""
-        start_date = self._normalize_date(start_date)
-        end_date = self._normalize_date(end_date)
+        start_date = normalize_date(start_date)
+        end_date = normalize_date(end_date)
 
         if start_date > end_date:
             raise ValueError("start_date must not be later than end_date")
@@ -672,8 +686,8 @@ class DBmanager:
         kind: str = "expense",
     ) -> list[dict[str, Any]]:
         """按分类汇总指定收支类型的金额、笔数和占比。"""
-        start_date = self._normalize_date(start_date)
-        end_date = self._normalize_date(end_date)
+        start_date = normalize_date(start_date)
+        end_date = normalize_date(end_date)
 
         if start_date > end_date:
             raise ValueError("start_date must not be later than end_date")
@@ -695,19 +709,13 @@ class DBmanager:
         granularity: str = "day",
     ) -> list[dict[str, Any]]:
         """按日、周或月汇总收入与支出，并补齐空时间段。"""
-        start = self._normalize_date(start_date)
-        end = self._normalize_date(end_date)
+        start = normalize_date(start_date)
+        end = normalize_date(end_date)
 
         if start > end:
             raise ValueError("start_date must not be later than end_date")
 
-        if (
-            not isinstance(granularity, str)
-            or granularity not in {"day", "week", "month"}
-        ):
-            raise ValueError(
-                "granularity must be day, week, or month"
-            )
+        granularity = normalize_granularity(granularity)
 
         with self._connection() as conn:
             return self._trend_with_connection(
@@ -722,10 +730,81 @@ class DBmanager:
         month: str,
     ) -> list[dict[str, Any]]:
         """计算月度预算的执行金额、剩余金额和使用比例。"""
-        month = self._normalize_month(month)
+        month = normalize_month(month)
 
         with self._connection() as conn:
             return self._budget_status_with_connection(conn, month)
+
+    def get_diagnosis_snapshot(
+        self,
+        month: str,
+    ) -> dict[str, Any]:
+        """在一个读事务中生成月度诊断所需的完整数据快照。"""
+        month = normalize_month(month)
+        start_date, end_date = month_bounds(month)
+
+        with self._connection() as conn:
+            with conn:
+                # 固定读取快照，确保四部分统计来自同一数据时点。
+                conn.execute("BEGIN")
+                return {
+                    "month": month,
+                    "period": {
+                        "start_date": start_date,
+                        "end_date": end_date,
+                    },
+                    "summary": self._summary_with_connection(
+                        conn,
+                        start_date,
+                        end_date,
+                    ),
+                    "category_breakdown": (
+                        self._category_breakdown_with_connection(
+                            conn,
+                            start_date,
+                            end_date,
+                            "expense",
+                        )
+                    ),
+                    "daily_trend": self._trend_with_connection(
+                        conn,
+                        start_date,
+                        end_date,
+                        "day",
+                    ),
+                    "budget_status": (
+                        self._budget_status_with_connection(
+                            conn,
+                            month,
+                        )
+                    ),
+                }
+
+    # 查询内部辅助
+
+    @staticmethod
+    def _transaction_select() -> str:
+        """返回账目查询公共 SELECT，并连接分类表补充分类信息。"""
+        return (
+            "SELECT "
+            "t.id, t.kind, t.amount_cents, t.category_id, "
+            "c.name AS category_name, "
+            "c.kind AS category_kind, "
+            "c.is_active AS category_active, "
+            "t.occurred_on, t.note, "
+            "t.created_at, t.updated_at "
+            "FROM transactions AS t "
+            "JOIN categories AS c ON c.id = t.category_id"
+        )
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """转义 LIKE 查询中的反斜杠、百分号和下划线。"""
+        return (
+            value.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
 
     @staticmethod
     def _summary_with_connection(
@@ -805,16 +884,15 @@ class DBmanager:
             for row in rows
         ]
 
-    @classmethod
+    @staticmethod
     def _trend_with_connection(
-        cls,
         conn: sqlite3.Connection,
         start: str,
         end: str,
         granularity: str,
     ) -> list[dict[str, Any]]:
         """在调用方提供的连接上汇总趋势并补齐空周期。"""
-        periods = cls._periods(start, end, granularity)
+        periods = build_periods(start, end, granularity)
         totals = {
             period: {
                 "income_cents": 0,
@@ -838,7 +916,7 @@ class DBmanager:
         ).fetchall()
 
         for row in rows:
-            period = cls._period_key(
+            period = period_key(
                 row["occurred_on"],
                 granularity,
             )
@@ -865,7 +943,7 @@ class DBmanager:
         month: str,
     ) -> list[dict[str, Any]]:
         """在调用方提供的连接上计算月度预算执行情况。"""
-        start_date, end_date = cls._month_bounds(month)
+        start_date, end_date = month_bounds(month)
         rows = conn.execute(
             "SELECT "
             "b.id, b.category_id, "
@@ -908,265 +986,6 @@ class DBmanager:
             result.append(item)
 
         return result
-
-    def get_diagnosis_snapshot(
-        self,
-        month: str,
-    ) -> dict[str, Any]:
-        """在一个读事务中生成月度诊断所需的完整数据快照。"""
-        month = self._normalize_month(month)
-        start_date, end_date = self._month_bounds(month)
-
-        with self._connection() as conn:
-            with conn:
-                # 固定读取快照，确保四部分统计来自同一数据时点。
-                conn.execute("BEGIN")
-                return {
-                    "month": month,
-                    "period": {
-                        "start_date": start_date,
-                        "end_date": end_date,
-                    },
-                    "summary": self._summary_with_connection(
-                        conn,
-                        start_date,
-                        end_date,
-                    ),
-                    "category_breakdown": (
-                        self._category_breakdown_with_connection(
-                            conn,
-                            start_date,
-                            end_date,
-                            "expense",
-                        )
-                    ),
-                    "daily_trend": self._trend_with_connection(
-                        conn,
-                        start_date,
-                        end_date,
-                        "day",
-                    ),
-                    "budget_status": (
-                        self._budget_status_with_connection(
-                            conn,
-                            month,
-                        )
-                    ),
-                }
-
-    @staticmethod
-    def _validate_kind(value: str) -> str:
-        """只接受 expense 或 income 两个固定英文类型。"""
-        if (
-            not isinstance(value, str)
-            or value not in {"expense", "income"}
-        ):
-            raise ValueError("kind must be expense or income")
-
-        return value
-
-    @staticmethod
-    def _validate_id(value: int, field: str) -> int:
-        """要求数据库 ID 是大于零的整数，并排除布尔值。"""
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value <= 0
-        ):
-            raise ValueError(f"{field} must be a positive integer")
-
-        return value
-
-    @staticmethod
-    def _validate_amount(
-        value: int,
-        *,
-        allow_zero: bool,
-    ) -> int:
-        """校验整数金额，并根据业务场景决定是否允许零。"""
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError("amount_cents must be an integer")
-
-        if value < 0 or (value == 0 and not allow_zero):
-            raise ValueError(
-                "amount_cents is outside the allowed range"
-            )
-
-        return value
-
-    @staticmethod
-    def _normalize_date(value: str | date) -> str:
-        """把日期统一为 SQLite 可比较的 YYYY-MM-DD 字符串。"""
-        if isinstance(value, datetime):
-            value = value.date()
-
-        if isinstance(value, date):
-            return value.isoformat()
-
-        if not isinstance(value, str):
-            raise ValueError("date must be YYYY-MM-DD")
-
-        try:
-            return date.fromisoformat(value).isoformat()
-        except ValueError as exc:
-            raise ValueError("date must be YYYY-MM-DD") from exc
-
-    @staticmethod
-    def _normalize_month(value: str) -> str:
-        """校验并返回 YYYY-MM 格式的月份。"""
-        if (
-            not isinstance(value, str)
-            or len(value) != 7
-            or value[4] != "-"
-        ):
-            raise ValueError("month must be YYYY-MM")
-
-        try:
-            date.fromisoformat(value + "-01")
-        except ValueError as exc:
-            raise ValueError("month must be YYYY-MM") from exc
-
-        return value
-
-    @classmethod
-    def _month_bounds(cls, month: str) -> tuple[str, str]:
-        """返回某个月第一天和最后一天的日期字符串。"""
-        month = cls._normalize_month(month)
-        year, month_number = map(int, month.split("-"))
-        last_day = calendar.monthrange(year, month_number)[1]
-
-        return (
-            f"{month}-01",
-            f"{month}-{last_day:02d}",
-        )
-
-    @staticmethod
-    def _normalize_name(value: str) -> str:
-        """去除分类名称两端空白，并禁止空名称。"""
-        if not isinstance(value, str):
-            raise ValueError("name must be a string")
-
-        value = value.strip()
-
-        if not value:
-            raise ValueError("name must not be empty")
-
-        return value
-
-    @staticmethod
-    def _normalize_note(value: str) -> str:
-        """校验备注类型并去除两端空白。"""
-        if not isinstance(value, str):
-            raise ValueError("note must be a string")
-
-        return value.strip()
-
-    @staticmethod
-    def _validate_paging(
-        limit: int,
-        offset: int,
-    ) -> tuple[int, int]:
-        """限制分页大小并确保偏移量不是负数。"""
-        if (
-            isinstance(limit, bool)
-            or not isinstance(limit, int)
-            or not 1 <= limit <= 200
-        ):
-            raise ValueError("limit must be between 1 and 200")
-
-        if (
-            isinstance(offset, bool)
-            or not isinstance(offset, int)
-            or offset < 0
-        ):
-            raise ValueError(
-                "offset must be a non-negative integer"
-            )
-
-        return limit, offset
-
-    @staticmethod
-    def _now() -> str:
-        """生成带 Z 后缀的 UTC 时间字符串。"""
-        return (
-            datetime.now(timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
-        )
-
-    @staticmethod
-    def _escape_like(value: str) -> str:
-        """转义 LIKE 查询中的反斜杠、百分号和下划线。"""
-        return (
-            value.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
-
-    @staticmethod
-    def _transaction_select() -> str:
-        """返回账目查询公共 SELECT，并连接分类表补充分类信息。"""
-        return (
-            "SELECT "
-            "t.id, t.kind, t.amount_cents, t.category_id, "
-            "c.name AS category_name, "
-            "c.kind AS category_kind, "
-            "c.is_active AS category_active, "
-            "t.occurred_on, t.note, "
-            "t.created_at, t.updated_at "
-            "FROM transactions AS t "
-            "JOIN categories AS c ON c.id = t.category_id"
-        )
-
-    @staticmethod
-    def _category_dict(
-        row: sqlite3.Row,
-    ) -> dict[str, Any]:
-        """把分类查询结果转换成普通字典。"""
-        return {
-            "id": int(row["id"]),
-            "name": row["name"],
-            "kind": row["kind"],
-            "is_active": bool(row["is_active"]),
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
-
-    @staticmethod
-    def _transaction_dict(
-        row: sqlite3.Row,
-    ) -> dict[str, Any]:
-        """把账目联表查询结果转换成普通字典。"""
-        return {
-            "id": int(row["id"]),
-            "kind": row["kind"],
-            "amount_cents": int(row["amount_cents"]),
-            "category_id": int(row["category_id"]),
-            "category_name": row["category_name"],
-            "category_kind": row["category_kind"],
-            "category_active": bool(row["category_active"]),
-            "occurred_on": row["occurred_on"],
-            "note": row["note"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
-
-    @staticmethod
-    def _budget_dict(
-        row: sqlite3.Row,
-    ) -> dict[str, Any]:
-        """把预算联表查询结果转换成普通字典。"""
-        return {
-            "id": int(row["id"]),
-            "category_id": int(row["category_id"]),
-            "category_name": row["category_name"],
-            "category_kind": row["category_kind"],
-            "category_active": bool(row["category_active"]),
-            "month": row["month"],
-            "amount_cents": int(row["amount_cents"]),
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
 
     def _fetch_category(
         self,
@@ -1244,63 +1063,147 @@ class DBmanager:
         return self._budget_dict(row)
 
     @staticmethod
-    def _periods(
-        start: str,
-        end: str,
-        granularity: str,
-    ) -> list[str]:
-        """生成查询范围的日、周或月周期键。"""
-        start_date = date.fromisoformat(start)
-        end_date = date.fromisoformat(end)
-        periods = []
-
-        if granularity == "day":
-            current = start_date
-            while current <= end_date:
-                periods.append(current.isoformat())
-                current += timedelta(days=1)
-            return periods
-
-        if granularity == "week":
-            current = start_date - timedelta(
-                days=start_date.weekday()
-            )
-            while current <= end_date:
-                periods.append(current.isoformat())
-                current += timedelta(days=7)
-            return periods
-
-        current = start_date.replace(day=1)
-        while current <= end_date:
-            periods.append(current.strftime("%Y-%m"))
-
-            if current.month == 12:
-                current = current.replace(
-                    year=current.year + 1,
-                    month=1,
-                )
-            else:
-                current = current.replace(
-                    month=current.month + 1
-                )
-
-        return periods
+    def _category_dict(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        """把分类查询结果转换成普通字典。"""
+        return {
+            "id": int(row["id"]),
+            "name": row["name"],
+            "kind": row["kind"],
+            "is_active": bool(row["is_active"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     @staticmethod
-    def _period_key(
-        value: str,
-        granularity: str,
-    ) -> str:
-        """把具体日期映射到对应的日、周起始日或月份键。"""
-        current = date.fromisoformat(value)
+    def _transaction_dict(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        """把账目联表查询结果转换成普通字典。"""
+        return {
+            "id": int(row["id"]),
+            "kind": row["kind"],
+            "amount_cents": int(row["amount_cents"]),
+            "category_id": int(row["category_id"]),
+            "category_name": row["category_name"],
+            "category_kind": row["category_kind"],
+            "category_active": bool(row["category_active"]),
+            "occurred_on": row["occurred_on"],
+            "note": row["note"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
-        if granularity == "day":
-            return current.isoformat()
+    @staticmethod
+    def _budget_dict(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        """把预算联表查询结果转换成普通字典。"""
+        return {
+            "id": int(row["id"]),
+            "category_id": int(row["category_id"]),
+            "category_name": row["category_name"],
+            "category_kind": row["category_kind"],
+            "category_active": bool(row["category_active"]),
+            "month": row["month"],
+            "amount_cents": int(row["amount_cents"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
-        if granularity == "week":
-            return (
-                current
-                - timedelta(days=current.weekday())
-            ).isoformat()
+    # 输入校验与通用辅助
 
-        return current.strftime("%Y-%m")
+    @staticmethod
+    def _validate_kind(value: str) -> str:
+        """只接受 expense 或 income 两个固定英文类型。"""
+        if (
+            not isinstance(value, str)
+            or value not in {"expense", "income"}
+        ):
+            raise ValueError("kind must be expense or income")
+
+        return value
+
+    @staticmethod
+    def _validate_id(value: int, field: str) -> int:
+        """要求数据库 ID 是大于零的整数，并排除布尔值。"""
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+        ):
+            raise ValueError(f"{field} must be a positive integer")
+
+        return value
+
+    @staticmethod
+    def _validate_amount(
+        value: int,
+        *,
+        allow_zero: bool,
+    ) -> int:
+        """校验整数金额，并根据业务场景决定是否允许零。"""
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("amount_cents must be an integer")
+
+        if value < 0 or (value == 0 and not allow_zero):
+            raise ValueError(
+                "amount_cents is outside the allowed range"
+            )
+
+        return value
+
+    @staticmethod
+    def _normalize_name(value: str) -> str:
+        """去除分类名称两端空白，并禁止空名称。"""
+        if not isinstance(value, str):
+            raise ValueError("name must be a string")
+
+        value = value.strip()
+
+        if not value:
+            raise ValueError("name must not be empty")
+
+        return value
+
+    @staticmethod
+    def _normalize_note(value: str) -> str:
+        """校验备注类型并去除两端空白。"""
+        if not isinstance(value, str):
+            raise ValueError("note must be a string")
+
+        return value.strip()
+
+    @staticmethod
+    def _validate_paging(
+        limit: int,
+        offset: int,
+    ) -> tuple[int, int]:
+        """限制分页大小并确保偏移量不是负数。"""
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 200
+        ):
+            raise ValueError("limit must be between 1 and 200")
+
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+        ):
+            raise ValueError(
+                "offset must be a non-negative integer"
+            )
+
+        return limit, offset
+
+    @staticmethod
+    def _now() -> str:
+        """生成带 Z 后缀的 UTC 时间字符串。"""
+        return (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
