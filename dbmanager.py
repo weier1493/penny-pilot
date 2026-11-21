@@ -6,14 +6,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from date_utils import (
-    build_periods,
-    month_bounds,
-    normalize_date,
-    normalize_granularity,
-    normalize_month,
-    period_key,
-)
+from date_utils import normalize_date, normalize_month
 
 # SQLite 等待其他连接释放锁的最长时间，单位是毫秒。
 _BUSY_TIMEOUT_MS = 5000
@@ -157,6 +150,14 @@ class DBmanager:
             raise
         finally:
             conn.close()
+
+    @contextmanager
+    def read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """提供一致的只读事务，供组合查询共享同一数据快照。"""
+        with self._connection() as conn:
+            with conn:
+                conn.execute("BEGIN")
+                yield conn
 
     @staticmethod
     def _validate_schema(conn: sqlite3.Connection) -> None:
@@ -660,126 +661,6 @@ class DBmanager:
 
             return [self._budget_dict(row) for row in rows]
 
-    def get_summary(
-        self,
-        start_date: str | date,
-        end_date: str | date,
-    ) -> dict[str, Any]:
-        """统计日期范围内的收入、支出、结余和账目数量。"""
-        start_date = normalize_date(start_date)
-        end_date = normalize_date(end_date)
-
-        if start_date > end_date:
-            raise ValueError("start_date must not be later than end_date")
-
-        with self._connection() as conn:
-            return self._summary_with_connection(
-                conn,
-                start_date,
-                end_date,
-            )
-
-    def get_category_breakdown(
-        self,
-        start_date: str | date,
-        end_date: str | date,
-        kind: str = "expense",
-    ) -> list[dict[str, Any]]:
-        """按分类汇总指定收支类型的金额、笔数和占比。"""
-        start_date = normalize_date(start_date)
-        end_date = normalize_date(end_date)
-
-        if start_date > end_date:
-            raise ValueError("start_date must not be later than end_date")
-
-        kind = self._validate_kind(kind)
-
-        with self._connection() as conn:
-            return self._category_breakdown_with_connection(
-                conn,
-                start_date,
-                end_date,
-                kind,
-            )
-
-    def get_trend(
-        self,
-        start_date: str | date,
-        end_date: str | date,
-        granularity: str = "day",
-    ) -> list[dict[str, Any]]:
-        """按日、周或月汇总收入与支出，并补齐空时间段。"""
-        start = normalize_date(start_date)
-        end = normalize_date(end_date)
-
-        if start > end:
-            raise ValueError("start_date must not be later than end_date")
-
-        granularity = normalize_granularity(granularity)
-
-        with self._connection() as conn:
-            return self._trend_with_connection(
-                conn,
-                start,
-                end,
-                granularity,
-            )
-
-    def get_budget_status(
-        self,
-        month: str,
-    ) -> list[dict[str, Any]]:
-        """计算月度预算的执行金额、剩余金额和使用比例。"""
-        month = normalize_month(month)
-
-        with self._connection() as conn:
-            return self._budget_status_with_connection(conn, month)
-
-    def get_diagnosis_snapshot(
-        self,
-        month: str,
-    ) -> dict[str, Any]:
-        """在一个读事务中生成月度诊断所需的完整数据快照。"""
-        month = normalize_month(month)
-        start_date, end_date = month_bounds(month)
-
-        with self._connection() as conn:
-            with conn:
-                # 固定读取快照，确保四部分统计来自同一数据时点。
-                conn.execute("BEGIN")
-                return {
-                    "month": month,
-                    "period": {
-                        "start_date": start_date,
-                        "end_date": end_date,
-                    },
-                    "summary": self._summary_with_connection(
-                        conn,
-                        start_date,
-                        end_date,
-                    ),
-                    "category_breakdown": (
-                        self._category_breakdown_with_connection(
-                            conn,
-                            start_date,
-                            end_date,
-                            "expense",
-                        )
-                    ),
-                    "daily_trend": self._trend_with_connection(
-                        conn,
-                        start_date,
-                        end_date,
-                        "day",
-                    ),
-                    "budget_status": (
-                        self._budget_status_with_connection(
-                            conn,
-                            month,
-                        )
-                    ),
-                }
-
     # 查询内部辅助
 
     @staticmethod
@@ -806,13 +687,13 @@ class DBmanager:
             .replace("_", "\\_")
         )
 
-    @staticmethod
-    def _summary_with_connection(
+    def fetch_summary_totals(
+        self,
         conn: sqlite3.Connection,
         start_date: str,
         end_date: str,
-    ) -> dict[str, Any]:
-        """在调用方提供的连接上执行汇总查询。"""
+    ) -> dict[str, int]:
+        """查询日期范围内的收入、支出和账目数量。"""
         row = conn.execute(
             "SELECT "
             "COALESCE(SUM(CASE WHEN kind = 'income' "
@@ -827,26 +708,20 @@ class DBmanager:
             (start_date, end_date),
         ).fetchone()
 
-        income = int(row["total_income_cents"])
-        expense = int(row["total_expense_cents"])
-
         return {
-            "start_date": start_date,
-            "end_date": end_date,
-            "total_income_cents": income,
-            "total_expense_cents": expense,
-            "balance_cents": income - expense,
+            "total_income_cents": int(row["total_income_cents"]),
+            "total_expense_cents": int(row["total_expense_cents"]),
             "transaction_count": int(row["transaction_count"]),
         }
 
-    @staticmethod
-    def _category_breakdown_with_connection(
+    def fetch_category_totals(
+        self,
         conn: sqlite3.Connection,
         start_date: str,
         end_date: str,
         kind: str,
     ) -> list[dict[str, Any]]:
-        """在调用方提供的连接上执行分类汇总。"""
+        """查询日期范围内指定收支类型的分类金额和笔数。"""
         rows = conn.execute(
             "SELECT "
             "c.id AS category_id, "
@@ -863,8 +738,6 @@ class DBmanager:
             (kind, start_date, end_date),
         ).fetchall()
 
-        total = sum(int(row["total_cents"]) for row in rows)
-
         return [
             {
                 "category_id": int(row["category_id"]),
@@ -872,35 +745,17 @@ class DBmanager:
                 "category_active": bool(row["category_active"]),
                 "total_cents": int(row["total_cents"]),
                 "transaction_count": int(row["transaction_count"]),
-                "share_percent": (
-                    round(
-                        int(row["total_cents"]) * 100 / total,
-                        2,
-                    )
-                    if total
-                    else 0.0
-                ),
             }
             for row in rows
         ]
 
-    @staticmethod
-    def _trend_with_connection(
+    def fetch_daily_totals(
+        self,
         conn: sqlite3.Connection,
         start: str,
         end: str,
-        granularity: str,
     ) -> list[dict[str, Any]]:
-        """在调用方提供的连接上汇总趋势并补齐空周期。"""
-        periods = build_periods(start, end, granularity)
-        totals = {
-            period: {
-                "income_cents": 0,
-                "expense_cents": 0,
-            }
-            for period in periods
-        }
-
+        """查询日期范围内每日的收入和支出金额。"""
         rows = conn.execute(
             "SELECT "
             "occurred_on, "
@@ -915,35 +770,23 @@ class DBmanager:
             (start, end),
         ).fetchall()
 
-        for row in rows:
-            period = period_key(
-                row["occurred_on"],
-                granularity,
-            )
-            totals[period]["income_cents"] += int(
-                row["income_cents"]
-            )
-            totals[period]["expense_cents"] += int(
-                row["expense_cents"]
-            )
-
         return [
             {
-                "period": period,
-                "income_cents": totals[period]["income_cents"],
-                "expense_cents": totals[period]["expense_cents"],
+                "occurred_on": row["occurred_on"],
+                "income_cents": int(row["income_cents"]),
+                "expense_cents": int(row["expense_cents"]),
             }
-            for period in periods
+            for row in rows
         ]
 
-    @classmethod
-    def _budget_status_with_connection(
-        cls,
+    def fetch_budget_spending(
+        self,
         conn: sqlite3.Connection,
         month: str,
+        start_date: str,
+        end_date: str,
     ) -> list[dict[str, Any]]:
-        """在调用方提供的连接上计算月度预算执行情况。"""
-        start_date, end_date = month_bounds(month)
+        """查询指定月份各预算及其对应的实际支出。"""
         rows = conn.execute(
             "SELECT "
             "b.id, b.category_id, "
@@ -969,20 +812,9 @@ class DBmanager:
         ).fetchall()
 
         result = []
-
         for row in rows:
-            item = cls._budget_dict(row)
-            spent = int(row["spent_cents"])
-            budget = int(row["amount_cents"])
-
-            item["spent_cents"] = spent
-            item["remaining_cents"] = budget - spent
-            item["usage_ratio"] = (
-                round(spent / budget, 4)
-                if budget
-                else None
-            )
-            item["over_budget"] = spent > budget
+            item = self._budget_dict(row)
+            item["spent_cents"] = int(row["spent_cents"])
             result.append(item)
 
         return result
